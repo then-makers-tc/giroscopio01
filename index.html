@@ -100,16 +100,24 @@
     transition: opacity .5s ease;
   }
   #loading span{ font-size:12px; letter-spacing:0.25em; text-transform:uppercase; color:rgba(234,230,245,0.5); }
+
+  #errBox{
+    position:fixed; left:16px; right:16px; bottom:16px; z-index:50;
+    display:none; background:rgba(120,10,20,0.92); color:#fff;
+    padding:12px 14px; border-radius:10px; font-size:12px; line-height:1.5;
+    white-space:pre-wrap; word-break:break-word;
+  }
 </style>
 </head>
 <body>
 
 <div id="loading"><span>Cargando escena…</span></div>
+<div id="errBox"></div>
 
 <div id="overlay">
   <div id="topbar"><div id="title">Giroscopio · AR</div></div>
   <div style="pointer-events:none;">
-    <div id="hint">Mueve el teléfono para mapear el espacio, luego toca el suelo para colocar el objeto</div>
+    <div id="hint">Iniciando…</div>
     <div id="controls">
       <button class="pill ghost" id="scaleDown">– escala</button>
       <button class="pill ghost" id="scaleUp">+ escala</button>
@@ -144,15 +152,25 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 
+function showError(msg){
+  const box = document.getElementById("errBox");
+  box.style.display = "block";
+  box.textContent = "Error: " + msg;
+  const loading = document.getElementById("loading");
+  if (loading) loading.remove();
+}
+window.addEventListener("error", (e)=> showError(e.message || String(e)));
+window.addEventListener("unhandledrejection", (e)=> showError((e.reason && e.reason.message) || String(e.reason)));
+
 let camera, scene, renderer, composer;
 let reticle, hitTestSource = null, hitTestSourceRequested = false;
 let gyro = null, glowDisc = null;
-let placed = false;
+let placed = false, autoPlaced = false;
 let currentScale = 1;
 let controls = null; // desktop orbit controls (fallback)
 let clock = new THREE.Clock();
 
-init();
+init().catch(e=> showError(e.message || String(e)));
 
 async function init(){
   scene = new THREE.Scene();
@@ -207,11 +225,14 @@ async function init(){
   document.getElementById("scaleUp").addEventListener("click", ()=> setScale(currentScale*1.15));
   document.getElementById("scaleDown").addEventListener("click", ()=> setScale(currentScale/1.15));
   document.getElementById("resetBtn").addEventListener("click", ()=>{
-    placed = false;
-    gyro.visible = false;
-    glowDisc.visible = false;
-    document.getElementById("hint").style.opacity = 1;
-    document.getElementById("hint").textContent = "Toca el suelo para colocar el objeto";
+    if (renderer.xr.isPresenting){
+      placed = false;
+      placeInFrontOfCamera();
+    } else {
+      // desktop fallback: just re-center
+      gyro.position.set(0,0,0);
+      glowDisc.position.set(0,-0.32,0);
+    }
   });
 
   const supported = navigator.xr && await navigator.xr.isSessionSupported("immersive-ar").catch(()=>false);
@@ -251,23 +272,43 @@ async function init(){
 }
 
 function onSessionStart(){
-  document.getElementById("hint").textContent = "Mueve el teléfono para mapear el espacio, luego toca el suelo para colocar el objeto";
+  placed = false;
+  autoPlaced = false;
+  document.getElementById("hint").textContent = "Colocando el objeto frente a ti…";
+  document.getElementById("hint").style.opacity = 1;
 }
 function onSessionEnd(){
   hitTestSource = null;
   hitTestSourceRequested = false;
+  autoPlaced = false;
+}
+
+function placeAt(x, y, z){
+  gyro.position.set(x, y + 0.05, z);
+  glowDisc.position.set(x, y - 0.25, z);
+  gyro.visible = true;
+  glowDisc.visible = true;
+  placed = true;
+  document.getElementById("hint").textContent = "Toca una superficie para anclarlo ahí, o usa Reubicar";
+  setTimeout(()=>{ document.getElementById("hint").style.opacity = 0; }, 2500);
+}
+
+// fallback: places the object ~0.8m in front of the camera, slightly below eye level
+function placeInFrontOfCamera(){
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  const camPos = new THREE.Vector3();
+  camera.getWorldPosition(camPos);
+  const target = camPos.clone().addScaledVector(dir, 0.8);
+  target.y -= 0.15;
+  placeAt(target.x, target.y, target.z);
+  autoPlaced = true;
 }
 
 function onSelect(){
   if (!reticle.visible) return;
-  gyro.position.setFromMatrixPosition(reticle.matrix);
-  glowDisc.position.setFromMatrixPosition(reticle.matrix);
-  glowDisc.position.y += 0.001;
-  gyro.position.y += 0.28; // float above the floor point
-  gyro.visible = true;
-  glowDisc.visible = true;
-  placed = true;
-  document.getElementById("hint").style.opacity = 0;
+  const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+  placeAt(pos.x, pos.y + 0.28, pos.z);
 }
 
 function setScale(s){
@@ -289,7 +330,8 @@ function buildGyroscope(){
   const group = new THREE.Group();
 
   const ringMat = new THREE.MeshStandardMaterial({
-    color: 0x0a0a0d, metalness: 0.85, roughness: 0.25,
+    color: 0x1c1622, metalness: 0.7, roughness: 0.3,
+    emissive: 0x2a1440, emissiveIntensity: 0.35,
     envMapIntensity: 1.0
   });
 
@@ -435,6 +477,10 @@ function render(timestamp, frame){
   if (frame){
     const refSpace = renderer.xr.getReferenceSpace();
     const session = renderer.xr.getSession();
+
+    if (!autoPlaced && !placed){
+      placeInFrontOfCamera();
+    }
 
     if (!hitTestSourceRequested){
       session.requestReferenceSpace("viewer").then(viewerSpace=>{
